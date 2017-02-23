@@ -19,6 +19,7 @@ import (
 	"strconv"
 
 	"github.com/huangnauh/hraftd/serf"
+	"github.com/huangnauh/hraftd/member"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
 )
@@ -34,26 +35,7 @@ type command struct {
 	Value string `json:"value,omitempty"`
 }
 
-// MemberStatus is the state that a member is in.
-type MemberStatus int
 
-// Different possible states of serf member
-const (
-	StatusNone MemberStatus = iota
-	StatusAlive
-	StatusLeaving
-	StatusLeft
-	StatusFailed
-	StatusReap
-)
-
-type ClusterMember struct {
-	ID   int64  `json:"id"`
-	IP   string `json:"addr"`
-
-	RaftPort int          `json:"-"`
-	Status   MemberStatus `json:"-"`
-}
 
 // Store is a simple key-value store, where all changes are made via Raft consensus.
 type Store struct {
@@ -66,9 +48,9 @@ type Store struct {
 
 	raft *raft.Raft // The consensus mechanism
 	serf *serf.Serf
-	peers    map[int64]*ClusterMember
+	peers    map[int64]*member.ClusterMember
 
-	reconcileCh chan<- *ClusterMember
+	reconcileCh chan *member.ClusterMember
 	reconcileInterval time.Duration
 
 	shutdownCh   chan struct{}
@@ -106,18 +88,18 @@ func (s *Store) Open(enableSingle bool, serfMembers []string, serfAddr string) e
 
 	raftPort, err := getPortFromAddr(s.RaftBind)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	conn := &ClusterMember{
+	conn := &member.ClusterMember{
 		ID:       s.id,
 		RaftPort: raftPort,
 	}
 
-	s.serf = serf.New(serfMembers, serfAddr)
+	s.serf, err = serf.New(serfMembers, serfAddr)
 
 	if err := s.serf.Bootstrap(conn, s.reconcileCh); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Setup Raft configuration.
@@ -207,7 +189,7 @@ func (s *Store) leaderLoop(stopCh chan struct{}) {
 
 	// Reconcile channel is only used once initial reconcile
 	// has succeeded
-	var reconcileCh chan *ClusterMember
+	var reconcileCh chan *member.ClusterMember
 	establishedLeader := false
 
 RECONCILE:
@@ -281,17 +263,17 @@ func (s *Store) establishLeadership() error {
 }
 
 
-func (s *Store) reconcileMember(member *ClusterMember) error {
+func (s *Store) reconcileMember(memb *member.ClusterMember) error {
 	// don't reconcile ourself
-	if member.ID == s.id {
+	if memb.ID == s.id {
 		return nil
 	}
 	var err error
-	switch member.Status {
-	case StatusAlive:
-		err = s.addRaftPeer(member)
-	case StatusLeft, StatusReap:
-		err = s.removeRaftPeer(member)
+	switch memb.Status {
+	case member.StatusAlive:
+		err = s.addRaftPeer(memb)
+	case member.StatusLeft, member.StatusReap:
+		err = s.removeRaftPeer(memb)
 	}
 	if err != nil {
 		return err
@@ -299,14 +281,28 @@ func (s *Store) reconcileMember(member *ClusterMember) error {
 	return nil
 }
 
-func (s *Store) addRaftPeer(member *ClusterMember) error {
-	addr := &net.TCPAddr{IP: net.ParseIP(member.IP), Port: member.RaftPort}
-	return s.raft.AddPeer(addr.String())
+func (s *Store) addRaftPeer(memb *member.ClusterMember) error {
+	addr := &net.TCPAddr{IP: net.ParseIP(memb.IP), Port: memb.RaftPort}
+	future := s.raft.AddPeer(addr.String())
+	if err := future.Error(); err != nil && err != raft.ErrKnownPeer {
+		s.logger.Printf("failed to add raft peer: %v", err)
+		return err
+	} else if err == nil {
+		s.logger.Printf("added raft peer: %v", addr)
+	}
+	return nil
 }
 
-func (s *Store) removeRaftPeer(member *ClusterMember) error {
-	addr := &net.TCPAddr{IP: net.ParseIP(member.IP), Port: member.RaftPort}
-	return s.raft.RemovePeer(addr.String())
+func (s *Store) removeRaftPeer(memb *member.ClusterMember) error {
+	addr := &net.TCPAddr{IP: net.ParseIP(memb.IP), Port: memb.RaftPort}
+	future := s.raft.RemovePeer(addr.String())
+	if err := future.Error(); err != nil && err != raft.ErrUnknownPeer {
+		s.logger.Printf("failed to remove raft peer: %v", err)
+		return err
+	} else if err == nil {
+		s.logger.Printf("removed raft peer: %v", addr)
+	}
+	return nil
 }
 
 

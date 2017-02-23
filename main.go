@@ -37,7 +37,8 @@ func init() {
 	flag.StringVar(&joinAddr, "join", "", "Set join address, if any")
 	flag.StringVar(&serfAddr, "saddr", DefaultSerfAddr, "Address for Serf to bind on")
 	flag.StringVar(&serfMember, "serfMember", "", "List of existing Serf members")
-	id = flag.Int64("id", 1, "ID")
+	var idFlag = flag.Int64("id", int64(1), "ID")
+	id = *idFlag
 	serfMembers = strings.Split(serfMember, ",")
 
 	flag.Usage = func() {

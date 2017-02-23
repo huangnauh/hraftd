@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/hashicorp/serf/serf"
-	"github.com/huangnauh/hraftd/store"
+	"github.com/huangnauh/hraftd/member"
 )
 
 const (
@@ -18,19 +18,19 @@ const (
 type Serf struct {
 	serf        *serf.Serf
 	addr        string
-	reconcileCh chan<- *store.ClusterMember
+	reconcileCh chan<- *member.ClusterMember
 	eventCh     chan serf.Event
 	initMembers []string
 	shutdownCh  chan struct{}
 
-	peers    map[int64]*store.ClusterMember
+	peers    map[int64]*member.ClusterMember
 	peerLock sync.RWMutex
 }
 
 // New Serf object
 func New(serfMembers []string, serfAddr string) (*Serf, error) {
 	b := &Serf{
-		peers:       make(map[int64]*store.ClusterMember),
+		peers:       make(map[int64]*member.ClusterMember),
 		eventCh:     make(chan serf.Event, 256),
 		shutdownCh:  make(chan struct{}),
 		initMembers: serfMembers,
@@ -42,7 +42,7 @@ func New(serfMembers []string, serfAddr string) (*Serf, error) {
 
 // Bootstrap saves the node metadata and starts the serf agent
 // Info of node updates is returned on reconcileCh channel
-func (b *Serf) Bootstrap(node *store.ClusterMember, reconcileCh chan<- *store.ClusterMember) error {
+func (b *Serf) Bootstrap(node *member.ClusterMember, reconcileCh chan<- *member.ClusterMember) error {
 	addr, strPort, err := net.SplitHostPort(b.addr)
 	if err != nil {
 		return err
@@ -157,11 +157,11 @@ func (b *Serf) Join(addrs ...string) (int, error) {
 }
 
 // Cluster is the list of all nodes connected to Serf
-func (b *Serf) Cluster() []*store.ClusterMember {
+func (b *Serf) Cluster() []*member.ClusterMember {
 	b.peerLock.RLock()
 	defer b.peerLock.RUnlock()
 
-	cluster := make([]*store.ClusterMember, 0, len(b.peers))
+	cluster := make([]*member.ClusterMember, 0, len(b.peers))
 	for _, v := range b.peers {
 		cluster = append(cluster, v)
 	}
@@ -169,7 +169,7 @@ func (b *Serf) Cluster() []*store.ClusterMember {
 }
 
 // Member returns broker details of node with given ID
-func (b *Serf) Member(memberID int64) *store.ClusterMember {
+func (b *Serf) Member(memberID int64) *member.ClusterMember {
 	b.peerLock.RLock()
 	defer b.peerLock.RUnlock()
 	return b.peers[memberID]
@@ -192,7 +192,7 @@ func (b *Serf) Shutdown() error {
 	return nil
 }
 
-func clusterMember(m serf.Member) (*store.ClusterMember, error) {
+func clusterMember(m serf.Member) (*member.ClusterMember, error) {
 	idStr := m.Tags["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -205,7 +205,7 @@ func clusterMember(m serf.Member) (*store.ClusterMember, error) {
 		return nil, err
 	}
 
-	conn := &store.ClusterMember{
+	conn := &member.ClusterMember{
 		IP:       m.Addr.String(),
 		ID:       int64(id),
 		RaftPort: raftPort,
@@ -215,19 +215,19 @@ func clusterMember(m serf.Member) (*store.ClusterMember, error) {
 	return conn, nil
 }
 
-func status(s serf.MemberStatus) store.MemberStatus {
+func status(s serf.MemberStatus) member.MemberStatus {
 	switch s {
 	case serf.StatusAlive:
-		return store.StatusAlive
+		return member.StatusAlive
 	case serf.StatusFailed:
-		return store.StatusFailed
+		return member.StatusFailed
 	case serf.StatusLeaving:
-		return store.StatusLeaving
+		return member.StatusLeaving
 	case serf.StatusLeft:
-		return store.StatusLeft
+		return member.StatusLeft
 	case statusReap:
-		return store.StatusReap
+		return member.StatusReap
 	default:
-		return store.StatusNone
+		return member.StatusNone
 	}
 }
