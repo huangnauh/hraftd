@@ -16,7 +16,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"strconv"
 
+	"github.com/huangnauh/hraftd/serf"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
 )
@@ -32,8 +34,30 @@ type command struct {
 	Value string `json:"value,omitempty"`
 }
 
+// MemberStatus is the state that a member is in.
+type MemberStatus int
+
+// Different possible states of serf member
+const (
+	StatusNone MemberStatus = iota
+	StatusAlive
+	StatusLeaving
+	StatusLeft
+	StatusFailed
+	StatusReap
+)
+
+type ClusterMember struct {
+	ID   int64  `json:"id"`
+	IP   string `json:"addr"`
+
+	RaftPort int          `json:"-"`
+	Status   MemberStatus `json:"-"`
+}
+
 // Store is a simple key-value store, where all changes are made via Raft consensus.
 type Store struct {
+	id       int64
 	RaftDir  string
 	RaftBind string
 
@@ -41,21 +65,61 @@ type Store struct {
 	m  map[string]string // The key-value store for the system.
 
 	raft *raft.Raft // The consensus mechanism
+	serf *serf.Serf
+	peers    map[int64]*ClusterMember
+
+	reconcileCh chan<- *ClusterMember
+	reconcileInterval time.Duration
+
+	shutdownCh   chan struct{}
 
 	logger *log.Logger
 }
 
 // New returns a new Store.
-func New() *Store {
+func New(id int64) *Store {
 	return &Store{
+		id:		id,
 		m:      make(map[string]string),
 		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
 	}
 }
 
+
+func getPortFromAddr(addr string) (int, error) {
+	_, strPort, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+
+	port, err := strconv.Atoi(strPort)
+	if err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+
 // Open opens the store. If enableSingle is set, and there are no existing peers,
 // then this node becomes the first node, and therefore leader, of the cluster.
-func (s *Store) Open(enableSingle bool) error {
+func (s *Store) Open(enableSingle bool, serfMembers []string, serfAddr string) error {
+
+	raftPort, err := getPortFromAddr(s.RaftBind)
+	if err != nil {
+		return nil, err
+	}
+
+	conn := &ClusterMember{
+		ID:       s.id,
+		RaftPort: raftPort,
+	}
+
+	s.serf = serf.New(serfMembers, serfAddr)
+
+	if err := s.serf.Bootstrap(conn, s.reconcileCh); err != nil {
+		return nil, err
+	}
+
 	// Setup Raft configuration.
 	config := raft.DefaultConfig()
 
@@ -104,8 +168,147 @@ func (s *Store) Open(enableSingle bool) error {
 		return fmt.Errorf("new raft: %s", err)
 	}
 	s.raft = ra
+
+	go s.monitorLeadership()
 	return nil
 }
+
+
+// monitorLeadership is used to monitor if we acquire or lose our role
+// as the leader in the Raft cluster. There is some work the leader is
+// expected to do, so we must react to changes
+func (s *Store) monitorLeadership() {
+	leaderCh := s.raft.LeaderCh()
+	var stopCh chan struct{}
+	for {
+		select {
+		case isLeader := <-leaderCh:
+			if isLeader {
+				stopCh = make(chan struct{})
+				go s.leaderLoop(stopCh)
+				s.logger.Printf("[INFO] hraftd: cluster leadership acquired")
+			} else if stopCh != nil {
+				close(stopCh)
+				stopCh = nil
+				s.logger.Printf("[INFO] hraftd: cluster leadership lost")
+			}
+		case <-s.shutdownCh:
+			return
+		}
+	}
+}
+
+
+// leaderLoop runs as long as we are the leader to run various
+// maintenance activities
+func (s *Store) leaderLoop(stopCh chan struct{}) {
+	// Ensure we revoke leadership on stepdown
+	defer s.revokeLeadership()
+
+	// Reconcile channel is only used once initial reconcile
+	// has succeeded
+	var reconcileCh chan *ClusterMember
+	establishedLeader := false
+
+RECONCILE:
+	// Setup a reconciliation timer
+	reconcileCh = nil
+	interval := time.After(s.reconcileInterval)
+
+	// Apply a raft barrier to ensure our FSM is caught up
+	barrier := s.raft.Barrier(0)
+	if err := barrier.Error(); err != nil {
+		s.logger.Printf("[ERR] hraftd: failed to wait for barrier: %v", err)
+		goto WAIT
+	}
+
+	// Check if we need to handle initial leadership actions
+	if !establishedLeader {
+		if err := s.establishLeadership(); err != nil {
+			s.logger.Printf("[ERR] hraftd: failed to establish leadership: %v",
+				err)
+			goto WAIT
+		}
+		establishedLeader = true
+	}
+
+	// Reconcile any missing data
+	if err := s.reconcile(); err != nil {
+		s.logger.Printf("[ERR] hraftd: failed to reconcile: %v", err)
+		goto WAIT
+	}
+
+	// Initial reconcile worked, now we can process the channel
+	// updates
+	reconcileCh = s.reconcileCh
+
+WAIT:
+	// Periodically reconcile as long as we are the leader,
+	// or when Serf events arrive
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-s.shutdownCh:
+			return
+		case <-interval:
+			goto RECONCILE
+		case member := <-reconcileCh:
+			s.reconcileMember(member)
+		}
+	}
+}
+
+func (s *Store) reconcile() error {
+	members := s.serf.Cluster()
+	for _, member := range members {
+		if err := s.reconcileMember(member); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+
+// revokeLeadership is invoked once we step down as leader.
+// This is used to cleanup any state that may be specific to the leader.
+func (s *Store) revokeLeadership() error {
+	return nil
+}
+
+func (s *Store) establishLeadership() error {
+	return nil
+}
+
+
+func (s *Store) reconcileMember(member *ClusterMember) error {
+	// don't reconcile ourself
+	if member.ID == s.id {
+		return nil
+	}
+	var err error
+	switch member.Status {
+	case StatusAlive:
+		err = s.addRaftPeer(member)
+	case StatusLeft, StatusReap:
+		err = s.removeRaftPeer(member)
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) addRaftPeer(member *ClusterMember) error {
+	addr := &net.TCPAddr{IP: net.ParseIP(member.IP), Port: member.RaftPort}
+	return s.raft.AddPeer(addr.String())
+}
+
+func (s *Store) removeRaftPeer(member *ClusterMember) error {
+	addr := &net.TCPAddr{IP: net.ParseIP(member.IP), Port: member.RaftPort}
+	return s.raft.RemovePeer(addr.String())
+}
+
 
 // Get returns the value for the given key.
 func (s *Store) Get(key string) (string, error) {
