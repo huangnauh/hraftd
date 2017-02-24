@@ -39,7 +39,9 @@ func init() {
 	flag.StringVar(&serfMember, "serfMember", "", "List of existing Serf members")
 	var idFlag = flag.Int64("id", int64(1), "ID")
 	id = *idFlag
-	serfMembers = strings.Split(serfMember, ",")
+	if serfMember != "" {
+		serfMembers = strings.Split(serfMember, ",")
+	}
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <raft-data-path> \n", os.Args[0])

@@ -63,7 +63,7 @@ func New(id int64) *Store {
 	return &Store{
 		id:		id,
 		m:      make(map[string]string),
-		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
+		logger: log.New(os.Stderr, "[hraftd-store] ", log.LstdFlags),
 	}
 }
 
@@ -268,6 +268,7 @@ func (s *Store) reconcileMember(memb *member.ClusterMember) error {
 	if memb.ID == s.id {
 		return nil
 	}
+	s.logger.Println("member: %v", memb)
 	var err error
 	switch memb.Status {
 	case member.StatusAlive:
@@ -282,6 +283,7 @@ func (s *Store) reconcileMember(memb *member.ClusterMember) error {
 }
 
 func (s *Store) addRaftPeer(memb *member.ClusterMember) error {
+	s.logger.Printf("addRaftPeer: %v", memb)
 	addr := &net.TCPAddr{IP: net.ParseIP(memb.IP), Port: memb.RaftPort}
 	future := s.raft.AddPeer(addr.String())
 	if err := future.Error(); err != nil && err != raft.ErrKnownPeer {

@@ -8,6 +8,8 @@ import (
 
 	"github.com/hashicorp/serf/serf"
 	"github.com/huangnauh/hraftd/member"
+	"log"
+	"os"
 )
 
 const (
@@ -25,6 +27,7 @@ type Serf struct {
 
 	peers    map[int64]*member.ClusterMember
 	peerLock sync.RWMutex
+	logger *log.Logger
 }
 
 // New Serf object
@@ -35,6 +38,7 @@ func New(serfMembers []string, serfAddr string) (*Serf, error) {
 		shutdownCh:  make(chan struct{}),
 		initMembers: serfMembers,
 		addr:		 serfAddr,
+		logger:      log.New(os.Stderr, "[hraftd-serf] ", log.LstdFlags),
 	}
 
 	return b, nil
@@ -104,12 +108,14 @@ func (b *Serf) serfEventHandler() {
 func (b *Serf) nodeJoinEvent(me serf.MemberEvent) {
 	for _, m := range me.Members {
 		// TODO: need to change these parts
+		b.logger.Println("member: %v", m)
 		peer, err := clusterMember(m)
 		if err != nil {
 			continue
 		}
 		b.peerLock.Lock()
 		b.peers[peer.ID] = peer
+		b.logger.Println("peers: %v", b.peers)
 		b.peerLock.Unlock()
 	}
 }
@@ -134,10 +140,12 @@ func (b *Serf) localMemberEvent(me serf.MemberEvent) error {
 		if isReap {
 			m.Status = statusReap
 		}
+		b.logger.Println("member: %v", m)
 		conn, err := clusterMember(m)
 		if err != nil {
 			continue
 		}
+		b.logger.Println("reconcileCh: %v", conn)
 		b.reconcileCh <- conn
 	}
 	return nil
