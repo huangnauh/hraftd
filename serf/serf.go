@@ -96,9 +96,12 @@ func (b *Serf) serfEventHandler() {
 				b.localMemberEvent(e.(serf.MemberEvent))
 			case serf.EventMemberUpdate, serf.EventMemberReap, serf.EventUser, serf.EventQuery:
 				// ignore
+                b.logger.Println("unhandled serf event: %#v", e)
 			default:
+                b.logger.Println("unhandled serf event: %#v", e)
 			}
 		case <-b.shutdownCh:
+            b.logger.Println("shutdownch")
 			return
 		}
 	}
@@ -108,14 +111,13 @@ func (b *Serf) serfEventHandler() {
 func (b *Serf) nodeJoinEvent(me serf.MemberEvent) {
 	for _, m := range me.Members {
 		// TODO: need to change these parts
-		b.logger.Println("member: %v", m)
 		peer, err := clusterMember(m)
 		if err != nil {
 			continue
 		}
 		b.peerLock.Lock()
 		b.peers[peer.ID] = peer
-		b.logger.Println("peers: %v", b.peers)
+		b.logger.Printf("adding peer: %v\n", peer)
 		b.peerLock.Unlock()
 	}
 }
@@ -140,12 +142,11 @@ func (b *Serf) localMemberEvent(me serf.MemberEvent) error {
 		if isReap {
 			m.Status = statusReap
 		}
-		b.logger.Println("member: %v", m)
+		b.logger.Printf("localMemberEvent member: %v\n", m)
 		conn, err := clusterMember(m)
 		if err != nil {
 			continue
 		}
-		b.logger.Println("reconcileCh: %v", conn)
 		b.reconcileCh <- conn
 	}
 	return nil

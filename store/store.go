@@ -54,6 +54,7 @@ type Store struct {
 	reconcileInterval time.Duration
 
 	shutdownCh   chan struct{}
+    leaderCh  chan bool
 
 	logger *log.Logger
 }
@@ -63,6 +64,9 @@ func New(id int64) *Store {
 	return &Store{
 		id:		id,
 		m:      make(map[string]string),
+        leaderCh:   make(chan bool, 1),
+        reconcileCh:    make(chan *member.ClusterMember, 32),
+        reconcileInterval:  time.Second * 5,
 		logger: log.New(os.Stderr, "[hraftd-store] ", log.LstdFlags),
 	}
 }
@@ -116,21 +120,37 @@ func (s *Store) Open(enableSingle bool, serfMembers []string, serfAddr string) e
 	}
 
 	// Create peer storage.
-	peerStore := raft.NewJSONPeers(s.RaftDir, transport)
+//	peerStore := raft.NewJSONPeers(s.RaftDir, transport)
 
 	// Check for any existing peers.
-	peers, err := peerStore.Peers()
-	if err != nil {
-		return err
-	}
+//	peers, err := peerStore.Peers()
+//	if err != nil {
+//		return err
+//	}
+
+    var peersAddrs []string
+    
+
+    peers := s.serf.Cluster()
+    for _, p := range peers {
+        addr := &net.TCPAddr{IP: net.ParseIP(p.IP), Port: p.RaftPort}
+        s.logger.Println("addr:", addr)
+        peersAddrs = append(peersAddrs, addr.String())
+    }
+    peerStore := raft.NewJSONPeers(s.RaftDir, transport)
+    if err = peerStore.SetPeers(peersAddrs); err != nil {
+        return err
+    }
 
 	// Allow the node to entry single-mode, potentially electing itself, if
 	// explicitly enabled and there is only 1 node in the cluster already.
-	if enableSingle && len(peers) <= 1 {
-		s.logger.Println("enabling single-node mode")
-		config.EnableSingleNode = true
-		config.DisableBootstrapAfterElect = false
-	}
+	//if enableSingle && len(peers) <= 1 {
+	//	s.logger.Println("enabling single-node mode")
+	//	config.EnableSingleNode = true
+	//	config.DisableBootstrapAfterElect = false
+	//}
+    config.NotifyCh = s.leaderCh
+    config.StartAsLeader = true
 
 	// Create the snapshot store. This allows the Raft to truncate the log.
 	snapshots, err := raft.NewFileSnapshotStore(s.RaftDir, retainSnapshotCount, os.Stderr)
@@ -160,7 +180,7 @@ func (s *Store) Open(enableSingle bool, serfMembers []string, serfAddr string) e
 // as the leader in the Raft cluster. There is some work the leader is
 // expected to do, so we must react to changes
 func (s *Store) monitorLeadership() {
-	leaderCh := s.raft.LeaderCh()
+	leaderCh := s.leaderCh
 	var stopCh chan struct{}
 	for {
 		select {
@@ -268,7 +288,6 @@ func (s *Store) reconcileMember(memb *member.ClusterMember) error {
 	if memb.ID == s.id {
 		return nil
 	}
-	s.logger.Println("member: %v", memb)
 	var err error
 	switch memb.Status {
 	case member.StatusAlive:
